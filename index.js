@@ -46,6 +46,31 @@ const ALL_STYLISTS = [
   { id: '1875e266-ba30-48a5-ab3b-ad670141b4d0', name: 'Danielle Carlon' }
 ];
 
+// PRODUCTION Service IDs (Phoenix Encanto) - for add-on resolution
+const SERVICE_MAP = {
+  'haircut_standard': 'f9160450-0b51-4ddc-bcc7-ac150103d5c0',
+  'haircut standard': 'f9160450-0b51-4ddc-bcc7-ac150103d5c0',
+  'standard': 'f9160450-0b51-4ddc-bcc7-ac150103d5c0',
+  'haircut': 'f9160450-0b51-4ddc-bcc7-ac150103d5c0',
+  'haircut_skin_fade': '14000cb7-a5bb-4a26-9f23-b0f3016cc009',
+  'skin_fade': '14000cb7-a5bb-4a26-9f23-b0f3016cc009',
+  'skin fade': '14000cb7-a5bb-4a26-9f23-b0f3016cc009',
+  'fade': '14000cb7-a5bb-4a26-9f23-b0f3016cc009',
+  'long_locks': '721e907d-fdae-41a5-bec4-ac150104229b',
+  'long locks': '721e907d-fdae-41a5-bec4-ac150104229b',
+  'wash': '67c644bc-237f-4794-8b48-ac150106d5ae',
+  'shampoo': '67c644bc-237f-4794-8b48-ac150106d5ae',
+  'grooming': '65ee2a0d-e995-4d8d-a286-ac150106994b',
+  'beard': '65ee2a0d-e995-4d8d-a286-ac150106994b',
+  'beard_trim': '65ee2a0d-e995-4d8d-a286-ac150106994b'
+};
+
+function resolveServiceId(input) {
+  if (!input) return null;
+  if (input.includes('-') && input.length > 30) return input;
+  return SERVICE_MAP[input.toLowerCase().trim()] || null;
+}
+
 let cachedToken = null;
 let tokenExpiry = null;
 
@@ -71,7 +96,8 @@ app.post('/find-next-available', async (req, res) => {
     date_start,
     date_end,
     specific_date,
-    location_id
+    location_id,
+    additional_services
   } = req.body;
 
   const locationId = location_id || CONFIG.LOCATION_ID;
@@ -81,6 +107,14 @@ app.post('/find-next-available', async (req, res) => {
       success: false,
       error: 'Missing required field: service_id'
     });
+  }
+
+  // Resolve add-on service IDs if provided
+  let addonServiceIds = [];
+  if (additional_services && Array.isArray(additional_services)) {
+    addonServiceIds = additional_services
+      .map(s => resolveServiceId(s))
+      .filter(s => s !== null);
   }
 
   let startDate, endDate;
@@ -100,11 +134,20 @@ app.post('/find-next-available', async (req, res) => {
 
   console.log(`PRODUCTION: Scanning all ${ALL_STYLISTS.length} barbers for earliest availability...`);
   console.log(`Date range: ${startDate} to ${endDate}`);
+  if (addonServiceIds.length > 0) {
+    console.log(`Add-on services: ${addonServiceIds.join(', ')}`);
+  }
 
   try {
     const token = await getMeevoToken();
 
     const scanPromises = ALL_STYLISTS.map(async (stylist) => {
+      // Build ScanServices array - primary service + any add-ons
+      const scanServices = [{ ServiceId: service_id, EmployeeIds: [stylist.id] }];
+      for (const addonId of addonServiceIds) {
+        scanServices.push({ ServiceId: addonId, EmployeeIds: [stylist.id] });
+      }
+
       const scanRequest = {
         LocationId: parseInt(locationId),
         TenantId: parseInt(CONFIG.TENANT_ID),
@@ -114,10 +157,7 @@ app.post('/find-next-available', async (req, res) => {
         ScanTimeType: 1,
         StartTime: '00:00',
         EndTime: '23:59',
-        ScanServices: [{
-          ServiceId: service_id,
-          EmployeeIds: [stylist.id]
-        }]
+        ScanServices: scanServices
       };
 
       try {
@@ -202,6 +242,8 @@ app.get('/health', (req, res) => {
     environment: 'PRODUCTION',
     location: 'Phoenix Encanto',
     service: 'Find Next Available',
+    version: '1.1.0',
+    features: ['additional_services support for add-ons'],
     stylists_count: ALL_STYLISTS.length
   });
 });
