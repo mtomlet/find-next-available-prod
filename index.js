@@ -325,7 +325,7 @@ app.post('/find-next-available', async (req, res) => {
       },
       total_openings_found: allOpenings.length,
       barbers_scanned: activeStylists.length,
-      all_openings: allOpenings.slice(0, 20),
+      all_openings: allOpenings.slice(0, 100),
       message: `Next available: ${earliest.formatted_full} with ${earliest.employee_name}`
     });
 
