@@ -209,19 +209,23 @@ app.post('/find-next-available', async (req, res) => {
       console.log(`Add-on services: ${addonServiceIds.join(', ')}`);
     }
 
-    // Meevo V2 scan/openings caps results at 8 slots per request.
-    // Strategy: use 2-hour windows as baseline, and if any window returns
-    // exactly 8 results (hit the cap), automatically split it into smaller
-    // sub-windows and re-scan to capture all slots.
+    // Meevo V2 scan/openings has two gotchas:
+    //   1) Hard cap of 8 slots per request
+    //   2) Excludes slots whose END time exceeds the window boundary
+    //      (e.g. a 3:45 PM slot ending at 4:05 PM won't appear in a
+    //       window ending at 4:00 PM, AND won't appear in 4:00-6:00
+    //       because its START is before 4:00)
+    // Fix: 30-minute overlap between windows catches boundary slots.
+    // Dedup logic already handles the double-counting from overlaps.
     const SLOT_CAP = 8;
     const TIME_WINDOWS = [
-      { start: '06:00', end: '08:00' },
-      { start: '08:00', end: '10:00' },
-      { start: '10:00', end: '12:00' },
-      { start: '12:00', end: '14:00' },
-      { start: '14:00', end: '16:00' },
-      { start: '16:00', end: '18:00' },
-      { start: '18:00', end: '20:00' },
+      { start: '06:00', end: '08:30' },
+      { start: '08:00', end: '10:30' },
+      { start: '10:00', end: '12:30' },
+      { start: '12:00', end: '14:30' },
+      { start: '14:00', end: '16:30' },
+      { start: '16:00', end: '18:30' },
+      { start: '18:00', end: '20:30' },
       { start: '20:00', end: '22:00' }
     ];
 
