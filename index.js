@@ -209,8 +209,11 @@ app.post('/find-next-available', async (req, res) => {
       console.log(`Add-on services: ${addonServiceIds.join(', ')}`);
     }
 
-    // Use smaller 3-hour time windows to bypass Meevo's 8-slot limit
-    // 2-hour windows to capture all slots (max 6 per window at 20min intervals)
+    // Meevo V2 scan/openings caps results at 8 slots per request.
+    // Strategy: use 2-hour windows as baseline, and if any window returns
+    // exactly 8 results (hit the cap), automatically split it into smaller
+    // sub-windows and re-scan to capture all slots.
+    const SLOT_CAP = 8;
     const TIME_WINDOWS = [
       { start: '06:00', end: '08:00' },
       { start: '08:00', end: '10:00' },
@@ -222,6 +225,74 @@ app.post('/find-next-available', async (req, res) => {
       { start: '20:00', end: '22:00' }
     ];
 
+    // Helper: split a time window into two halves
+    function splitWindow(startStr, endStr) {
+      const [sh, sm] = startStr.split(':').map(Number);
+      const [eh, em] = endStr.split(':').map(Number);
+      const startMin = sh * 60 + sm;
+      const endMin = eh * 60 + em;
+      const midMin = Math.floor((startMin + endMin) / 2);
+      const midStr = `${String(Math.floor(midMin / 60)).padStart(2, '0')}:${String(midMin % 60).padStart(2, '0')}`;
+      return [
+        { start: startStr, end: midStr },
+        { start: midStr, end: endStr }
+      ];
+    }
+
+    // Helper: scan a single time window for one stylist, returns raw slot array
+    async function scanWindow(scanServices, windowStart, windowEnd) {
+      const scanRequest = {
+        LocationId: parseInt(locationId),
+        TenantId: parseInt(CONFIG.TENANT_ID),
+        ScanDateType: 1,
+        StartDate: startDate,
+        EndDate: endDate,
+        ScanTimeType: 1,
+        StartTime: windowStart,
+        EndTime: windowEnd,
+        ScanServices: scanServices
+      };
+
+      const response = await axios.post(
+        `${CONFIG.API_URL_V2}/scan/openings?TenantId=${CONFIG.TENANT_ID}&LocationId=${locationId}`,
+        scanRequest,
+        {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+
+      const rawData = response.data?.data || [];
+      return rawData.flatMap(item => item.serviceOpenings || []);
+    }
+
+    // Helper: scan a window, and if it hits the 8-slot cap, recursively
+    // split into smaller windows until all slots are captured.
+    // Stops splitting at 30-min windows (minimum useful granularity).
+    async function scanWindowAdaptive(scanServices, windowStart, windowEnd, stylistName, depth = 0) {
+      try {
+        const slots = await scanWindow(scanServices, windowStart, windowEnd);
+
+        if (slots.length >= SLOT_CAP && depth < 3) {
+          // Hit the cap — split this window and re-scan both halves
+          console.log(`[Adaptive] ${stylistName} ${windowStart}-${windowEnd}: hit ${SLOT_CAP}-slot cap, splitting (depth ${depth + 1})`);
+          const [firstHalf, secondHalf] = splitWindow(windowStart, windowEnd);
+          const [firstSlots, secondSlots] = await Promise.all([
+            scanWindowAdaptive(scanServices, firstHalf.start, firstHalf.end, stylistName, depth + 1),
+            scanWindowAdaptive(scanServices, secondHalf.start, secondHalf.end, stylistName, depth + 1)
+          ]);
+          return [...firstSlots, ...secondSlots];
+        }
+
+        return slots;
+      } catch (error) {
+        console.error(`PRODUCTION: Error scanning ${stylistName} (${windowStart}-${windowEnd}):`, error.message);
+        return [];
+      }
+    }
+
     const scanPromises = activeStylists.map(async (stylist) => {
       // Build ScanServices array - primary service + any add-ons
       const scanServices = [{ ServiceId: service_id, EmployeeIds: [stylist.id] }];
@@ -229,68 +300,39 @@ app.post('/find-next-available', async (req, res) => {
         scanServices.push({ ServiceId: addonId, EmployeeIds: [stylist.id] });
       }
 
-      // Scan all time windows in parallel for this stylist
-      const windowScans = TIME_WINDOWS.map(async (window) => {
-        const scanRequest = {
-          LocationId: parseInt(locationId),
-          TenantId: parseInt(CONFIG.TENANT_ID),
-          ScanDateType: 1,
-          StartDate: startDate,
-          EndDate: endDate,
-          ScanTimeType: 1,
-          StartTime: window.start,
-          EndTime: window.end,
-          ScanServices: scanServices
-        };
-
-        try {
-          const response = await axios.post(
-            `${CONFIG.API_URL_V2}/scan/openings?TenantId=${CONFIG.TENANT_ID}&LocationId=${locationId}`,
-            scanRequest,
-            {
-              headers: {
-                'Authorization': `Bearer ${token}`,
-                'Content-Type': 'application/json'
-              }
-            }
-          );
-
-          const rawData = response.data?.data || [];
-          return rawData.flatMap(item =>
-            (item.serviceOpenings || []).map(slot => {
-              const dateParts = formatDateParts(slot.startTime);
-              const formattedTime = formatTime(slot.startTime);
-              return {
-                startTime: slot.startTime,
-                endTime: slot.endTime,
-                date: slot.date,
-                employee_id: stylist.id,
-                employee_name: stylist.name,
-                serviceId: slot.serviceId,
-                serviceName: slot.serviceName,
-                price: slot.employeePrice,
-                day_of_week: dateParts.day_of_week,
-                formatted_date: dateParts.formatted_date,
-                formatted_time: formattedTime,
-                formatted_full: `${dateParts.formatted_full_date} at ${formattedTime}`
-              };
-            })
-          );
-        } catch (error) {
-          console.error(`PRODUCTION: Error scanning ${stylist.name} (${window.start}-${window.end}):`, error.message);
-          return [];
-        }
-      });
+      // Scan all time windows in parallel for this stylist, with adaptive splitting
+      const windowScans = TIME_WINDOWS.map(window =>
+        scanWindowAdaptive(scanServices, window.start, window.end, stylist.name)
+      );
 
       const windowResults = await Promise.all(windowScans);
 
-      // Combine and deduplicate by startTime
+      // Combine, format, and deduplicate by startTime
       const seenTimes = new Set();
-      return windowResults.flat().filter(slot => {
-        if (seenTimes.has(slot.startTime)) return false;
-        seenTimes.add(slot.startTime);
-        return true;
-      });
+      return windowResults.flat()
+        .map(slot => {
+          const dateParts = formatDateParts(slot.startTime);
+          const formattedTime = formatTime(slot.startTime);
+          return {
+            startTime: slot.startTime,
+            endTime: slot.endTime,
+            date: slot.date,
+            employee_id: stylist.id,
+            employee_name: stylist.name,
+            serviceId: slot.serviceId,
+            serviceName: slot.serviceName,
+            price: slot.employeePrice,
+            day_of_week: dateParts.day_of_week,
+            formatted_date: dateParts.formatted_date,
+            formatted_time: formattedTime,
+            formatted_full: `${dateParts.formatted_full_date} at ${formattedTime}`
+          };
+        })
+        .filter(slot => {
+          if (seenTimes.has(slot.startTime)) return false;
+          seenTimes.add(slot.startTime);
+          return true;
+        });
     });
 
     const allResults = await Promise.all(scanPromises);
@@ -347,12 +389,12 @@ app.get('/health', (req, res) => {
     environment: 'PRODUCTION',
     location: 'Phoenix Encanto',
     service: 'Find Next Available',
-    version: '2.1.0',
+    version: '2.2.0',
     features: [
       'DYNAMIC active employee fetching (1-hour cache)',
       'additional_services support for add-ons',
       'formatted date fields (day_of_week, formatted_date, formatted_time, formatted_full)',
-      'full slot retrieval (6 parallel 3-hour scans to bypass 8-slot API limit)'
+      'adaptive window splitting to bypass 8-slot API cap (auto-subdivides when limit hit)'
     ],
     stylists: 'dynamic (fetched from Meevo API)'
   });
