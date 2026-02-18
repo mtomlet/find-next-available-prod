@@ -209,20 +209,30 @@ app.post('/find-next-available', async (req, res) => {
       console.log(`Add-on services: ${addonServiceIds.join(', ')}`);
     }
 
-    // Use smaller 3-hour time windows to bypass Meevo's 8-slot limit
-    // 2-hour windows to capture all slots (max 6 per window at 20min intervals)
+    // Meevo V2 API has 8-slot limit per request
+    // Use 2hr windows with 1hr overlap (15 windows) to capture ALL slots including edge cases
     const TIME_WINDOWS = [
       { start: '06:00', end: '08:00' },
+      { start: '07:00', end: '09:00' },
       { start: '08:00', end: '10:00' },
+      { start: '09:00', end: '11:00' },
       { start: '10:00', end: '12:00' },
+      { start: '11:00', end: '13:00' },
       { start: '12:00', end: '14:00' },
+      { start: '13:00', end: '15:00' },
       { start: '14:00', end: '16:00' },
+      { start: '15:00', end: '17:00' },
       { start: '16:00', end: '18:00' },
+      { start: '17:00', end: '19:00' },
       { start: '18:00', end: '20:00' },
+      { start: '19:00', end: '21:00' },
       { start: '20:00', end: '22:00' }
     ];
 
-    const scanPromises = activeStylists.map(async (stylist) => {
+    // Scan stylists SEQUENTIALLY to avoid API rate limits/timeouts
+    // (15 parallel requests per stylist instead of 240 all at once)
+    const allResults = [];
+    for (const stylist of activeStylists) {
       // Build ScanServices array - primary service + any add-ons
       const scanServices = [{ ServiceId: service_id, EmployeeIds: [stylist.id] }];
       for (const addonId of addonServiceIds) {
@@ -284,17 +294,24 @@ app.post('/find-next-available', async (req, res) => {
 
       const windowResults = await Promise.all(windowScans);
 
-      // Combine and deduplicate by startTime
+      // Combine and deduplicate by startTime for this stylist
       const seenTimes = new Set();
-      return windowResults.flat().filter(slot => {
+      const stylistSlots = windowResults.flat().filter(slot => {
         if (seenTimes.has(slot.startTime)) return false;
         seenTimes.add(slot.startTime);
         return true;
       });
-    });
 
-    const allResults = await Promise.all(scanPromises);
-    const allOpenings = allResults.flat();
+      // DEBUG: Log slots per stylist
+      console.log(`[DEBUG] ${stylist.name}: ${stylistSlots.length} slots`);
+      if (stylist.name === 'Hannah') {
+        console.log(`[DEBUG] Hannah times: ${stylistSlots.map(s => s.formatted_time).join(', ')}`);
+      }
+
+      allResults.push(...stylistSlots);
+    }
+
+    const allOpenings = allResults;
 
     if (allOpenings.length === 0) {
       return res.json({
